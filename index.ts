@@ -3,121 +3,111 @@ import { serve } from "bun";
 // --- Configuration ---
 const PORT = process.env.PORT || 3000;
 const TARGET_URL = process.env.TARGET_URL || "https://www.assistant-ui.com/api/chat";
-const SERVER_API_KEY = process.env.SERVER_API_KEY; // <--- Lấy Key từ Env
+const SERVER_API_KEY = process.env.SERVER_API_KEY;
 
-const AVAILABLE_MODELS = [
-  { name: "GPT 4o-mini", value: "gpt-4o-mini" },
-  { name: "Deepseek R1", value: "deepseek-r1" },
-  { name: "Claude 3.5 Sonnet", value: "claude-3.5-sonnet" },
-  { name: "Gemini 2.0 Flash", value: "gemini-2.0-flash" },
-  { name: "Llama 3 8b", value: "llama-3-8b" },
-  { name: "Firefunction V2", value: "firefunction-v2" },
-  { name: "Mistral 7b", value: "mistral-7b" },
-];
+// --- Utils ---
+const log = (tag: string, msg: any) => console.log(`[${new Date().toISOString()}] [${tag}]`, msg);
 
-const TARGET_HEADERS = {
-  "authority": "www.assistant-ui.com",
-  "accept": "*/*",
-  "content-type": "application/json",
-  "origin": "https://www.assistant-ui.com",
-  "referer": "https://www.assistant-ui.com/",
-  "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
-  "sec-fetch-site": "same-origin",
-  "sec-fetch-mode": "cors",
-  "sec-fetch-dest": "empty",
-};
-
-// --- Helper: Convert OpenAI Messages ---
-function convertMessages(messages: any[]) {
-  return messages.map((msg) => ({
-    role: msg.role,
-    parts: [{ type: "text", text: msg.content }],
-    id: crypto.randomUUID().slice(0, 8),
-  }));
-}
-
-// --- Server Logic ---
+// --- Server ---
 console.log(`🚀 Bun Server running on port ${PORT}`);
-if (SERVER_API_KEY) console.log(`🔒 Secured with API Key: ${SERVER_API_KEY.slice(0, 3)}...***`);
-else console.log(`⚠️ Warning: No API Key set. Server is public!`);
+if (process.env.HTTP_PROXY) console.log(`🔌 Proxy Configured: ${process.env.HTTP_PROXY}`);
 
 serve({
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url);
 
-    // 1. Handle CORS (Cho phép preflight check không cần Auth)
+    // 1. CORS
     if (req.method === "OPTIONS") {
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization", // Cho phép header Authorization
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
         },
       });
     }
 
-    // 2. AUTHENTICATION CHECK (Logic mới thêm)
-    // Bỏ qua check nếu không set SERVER_API_KEY trong env (chế độ public)
+    // 2. Auth Check
     if (SERVER_API_KEY) {
       const authHeader = req.headers.get("Authorization");
-      // Format chuẩn: "Bearer <token>"
-      const token = authHeader?.startsWith("Bearer ") 
-        ? authHeader.slice(7) 
-        : authHeader;
-
+      const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
       if (token !== SERVER_API_KEY) {
-        console.log(`⛔ Unauthorized access attempt from ${req.headers.get("x-forwarded-for") || "unknown"}`);
-        return new Response(JSON.stringify({
-          error: {
-            message: "Invalid API Key. You are not authorized.",
-            type: "invalid_request_error",
-            param: null,
-            code: "invalid_api_key"
-          }
-        }), { status: 401, headers: { "Content-Type": "application/json" } });
+        log("AUTH", "⛔ Blocked unauthorized request");
+        return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
       }
     }
 
-    // 3. Handle /v1/models
-    if (url.pathname === "/v1/models" && req.method === "GET") {
-      const modelsData = AVAILABLE_MODELS.map((m) => ({
-        id: m.value,
-        object: "model",
-        created: Date.now(),
-        owned_by: "assistant-ui-proxy",
-      }));
-      return Response.json({ object: "list", data: modelsData });
+    // 3. Models Endpoint
+    if (url.pathname === "/v1/models") {
+      return Response.json({
+        object: "list",
+        data: [{ id: "gpt-4o-mini", object: "model", created: Date.now(), owned_by: "proxy" }]
+      });
     }
 
-    // 4. Handle Chat Completions
+    // 4. Chat Endpoint (DEBUG HEAVY)
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       try {
         const body = await req.json();
         const { messages, stream, model } = body;
+        
+        log("REQ", `Incoming chat request. Model: ${model}, Stream: ${stream}`);
+        log("REQ", `Last User Message: ${messages[messages.length - 1]?.content}`);
 
+        // Construct Payload
         const payload = {
             tools: { 
                 weather_search: { description: "Find weather", parameters: { type: "object", properties: { query: { type: "string" } } } } 
             },
             id: "DEFAULT_THREAD_ID",
-            messages: convertMessages(messages || []),
+            messages: messages.map((msg: any) => ({
+                role: msg.role,
+                parts: [{ type: "text", text: msg.content }],
+                id: crypto.randomUUID().slice(0, 8),
+            })),
             trigger: "submit-message",
             metadata: {}
         };
 
+        // --- Gửi request và Log ---
+        log("UPSTREAM", `Sending request to ${TARGET_URL}...`);
+        
         const targetResp = await fetch(TARGET_URL, {
           method: "POST",
-          headers: TARGET_HEADERS,
+          headers: {
+            "authority": "www.assistant-ui.com",
+            "accept": "*/*",
+            "content-type": "application/json",
+            "origin": "https://www.assistant-ui.com",
+            "referer": "https://www.assistant-ui.com/",
+            "user-agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+          },
           body: JSON.stringify(payload),
+          // Proxy sẽ được Bun tự động dùng nếu có env HTTP_PROXY
         });
 
-        if (!targetResp.ok) {
-            return new Response(JSON.stringify({ error: "Upstream Error" }), { status: 502 });
-        }
-        if (!targetResp.body) return new Response("No body", { status: 500 });
+        log("UPSTREAM", `Response Status: ${targetResp.status} ${targetResp.statusText}`);
 
+        // --- Xử lý lỗi từ Upstream ---
+        if (!targetResp.ok) {
+            const errorText = await targetResp.text();
+            log("UPSTREAM_ERROR", errorText); // <--- QUAN TRỌNG: Xem server báo lỗi gì ở đây
+            return new Response(JSON.stringify({ 
+                error: "Upstream Error", 
+                details: errorText,
+                status: targetResp.status 
+            }), { status: 502 });
+        }
+
+        if (!targetResp.body) {
+            log("ERROR", "Empty body received");
+            return new Response("No body", { status: 500 });
+        }
+
+        // --- Streaming Logic ---
         if (stream) {
+          log("STREAM", "Starting stream forwarding...");
           const reader = targetResp.body.getReader();
           const decoder = new TextDecoder();
           const encoder = new TextEncoder();
@@ -130,16 +120,25 @@ serve({
                   const { done, value } = await reader.read();
                   if (done) break;
 
-                  buffer += decoder.decode(value, { stream: true });
+                  const chunkText = decoder.decode(value, { stream: true });
+                  // Debug: In ra một phần nhỏ data nhận được để xem format
+                  // log("DEBUG_CHUNK", chunkText.slice(0, 100) + "..."); 
+
+                  buffer += chunkText;
                   const lines = buffer.split("\n");
-                  buffer = lines.pop() || ""; 
+                  buffer = lines.pop() || "";
 
                   for (const line of lines) {
                     if (line.startsWith("data: ")) {
                       const dataStr = line.slice(6).trim();
                       if (dataStr === "[DONE]") continue;
+
                       try {
                         const event = JSON.parse(dataStr);
+                        
+                        // Debug: Log nếu gặp event lạ
+                        // if (event.type !== "text-delta") log("DEBUG_EVENT", event.type);
+
                         if (event.type === "text-delta" && event.delta) {
                           const chunk = {
                             id: "chatcmpl-" + crypto.randomUUID(),
@@ -150,12 +149,16 @@ serve({
                           };
                           controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                         }
-                      } catch (e) { }
+                      } catch (e) {
+                          log("PARSE_ERROR", `Failed to parse JSON: ${dataStr}`);
+                      }
                     }
                   }
                 }
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                log("STREAM", "Stream finished successfully.");
               } catch (err) {
+                log("STREAM_ERROR", err);
                 controller.error(err);
               } finally {
                 controller.close();
@@ -171,10 +174,12 @@ serve({
               "Access-Control-Allow-Origin": "*",
             },
           });
-        } else {
-            return Response.json({ error: "Stream required" }, { status: 400 });
         }
+        
+        return new Response("Stream mode required for this debug", { status: 400 });
+
       } catch (error) {
+        log("FATAL", error);
         return new Response(JSON.stringify({ error: "Internal Server Error" }), { status: 500 });
       }
     }
