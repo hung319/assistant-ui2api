@@ -3,8 +3,8 @@ import { serve } from "bun";
 // --- Configuration ---
 const PORT = process.env.PORT || 3000;
 const TARGET_URL = process.env.TARGET_URL || "https://www.assistant-ui.com/api/chat";
+const SERVER_API_KEY = process.env.SERVER_API_KEY; // <--- Lấy Key từ Env
 
-// List models theo yêu cầu (để validate hoặc hiển thị)
 const AVAILABLE_MODELS = [
   { name: "GPT 4o-mini", value: "gpt-4o-mini" },
   { name: "Deepseek R1", value: "deepseek-r1" },
@@ -15,7 +15,6 @@ const AVAILABLE_MODELS = [
   { name: "Mistral 7b", value: "mistral-7b" },
 ];
 
-// Fake Headers để bypass
 const TARGET_HEADERS = {
   "authority": "www.assistant-ui.com",
   "accept": "*/*",
@@ -28,36 +27,59 @@ const TARGET_HEADERS = {
   "sec-fetch-dest": "empty",
 };
 
-// --- Helper: Convert OpenAI Messages to Assistant-UI Format ---
+// --- Helper: Convert OpenAI Messages ---
 function convertMessages(messages: any[]) {
   return messages.map((msg) => ({
     role: msg.role,
     parts: [{ type: "text", text: msg.content }],
-    id: crypto.randomUUID().slice(0, 8), // Random ID ngắn
+    id: crypto.randomUUID().slice(0, 8),
   }));
 }
 
 // --- Server Logic ---
 console.log(`🚀 Bun Server running on port ${PORT}`);
-if (process.env.HTTP_PROXY) console.log(`🔌 Using Proxy: ${process.env.HTTP_PROXY}`);
+if (SERVER_API_KEY) console.log(`🔒 Secured with API Key: ${SERVER_API_KEY.slice(0, 3)}...***`);
+else console.log(`⚠️ Warning: No API Key set. Server is public!`);
 
 serve({
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url);
 
-    // 1. Handle CORS (quan trọng cho Web UI)
+    // 1. Handle CORS (Cho phép preflight check không cần Auth)
     if (req.method === "OPTIONS") {
       return new Response(null, {
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "POST, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization", // Cho phép header Authorization
         },
       });
     }
 
-    // 2. Handle /v1/models (Client thường gọi cái này trước)
+    // 2. AUTHENTICATION CHECK (Logic mới thêm)
+    // Bỏ qua check nếu không set SERVER_API_KEY trong env (chế độ public)
+    if (SERVER_API_KEY) {
+      const authHeader = req.headers.get("Authorization");
+      // Format chuẩn: "Bearer <token>"
+      const token = authHeader?.startsWith("Bearer ") 
+        ? authHeader.slice(7) 
+        : authHeader;
+
+      if (token !== SERVER_API_KEY) {
+        console.log(`⛔ Unauthorized access attempt from ${req.headers.get("x-forwarded-for") || "unknown"}`);
+        return new Response(JSON.stringify({
+          error: {
+            message: "Invalid API Key. You are not authorized.",
+            type: "invalid_request_error",
+            param: null,
+            code: "invalid_api_key"
+          }
+        }), { status: 401, headers: { "Content-Type": "application/json" } });
+      }
+    }
+
+    // 3. Handle /v1/models
     if (url.pathname === "/v1/models" && req.method === "GET") {
       const modelsData = AVAILABLE_MODELS.map((m) => ({
         id: m.value,
@@ -68,28 +90,22 @@ serve({
       return Response.json({ object: "list", data: modelsData });
     }
 
-    // 3. Handle Chat Completions
+    // 4. Handle Chat Completions
     if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
       try {
         const body = await req.json();
         const { messages, stream, model } = body;
 
-        // Build Payload cho Assistant-UI
-        // Lưu ý: Backend này có vẻ không thực sự switch model qua tham số, 
-        // nhưng ta vẫn nhận model ID để log.
         const payload = {
             tools: { 
-                // Hardcode tools schema để giống request gốc
                 weather_search: { description: "Find weather", parameters: { type: "object", properties: { query: { type: "string" } } } } 
             },
             id: "DEFAULT_THREAD_ID",
             messages: convertMessages(messages || []),
             trigger: "submit-message",
-            metadata: {} // Có thể inject model ID vào đây nếu backend hỗ trợ
+            metadata: {}
         };
 
-        // Gửi request tới Target
-        // Bun.fetch tự động dùng HTTP_PROXY từ env
         const targetResp = await fetch(TARGET_URL, {
           method: "POST",
           headers: TARGET_HEADERS,
@@ -97,14 +113,10 @@ serve({
         });
 
         if (!targetResp.ok) {
-            const errText = await targetResp.text();
-            console.error("Target Error:", targetResp.status, errText);
             return new Response(JSON.stringify({ error: "Upstream Error" }), { status: 502 });
         }
-
         if (!targetResp.body) return new Response("No body", { status: 500 });
 
-        // --- Xử lý Streaming (SSE Transformation) ---
         if (stream) {
           const reader = targetResp.body.getReader();
           const decoder = new TextDecoder();
@@ -113,7 +125,6 @@ serve({
           const streamResponse = new ReadableStream({
             async start(controller) {
               let buffer = "";
-
               try {
                 while (true) {
                   const { done, value } = await reader.read();
@@ -121,45 +132,30 @@ serve({
 
                   buffer += decoder.decode(value, { stream: true });
                   const lines = buffer.split("\n");
-                  buffer = lines.pop() || ""; // Giữ lại phần chưa hoàn chỉnh
+                  buffer = lines.pop() || ""; 
 
                   for (const line of lines) {
                     if (line.startsWith("data: ")) {
                       const dataStr = line.slice(6).trim();
                       if (dataStr === "[DONE]") continue;
-
                       try {
                         const event = JSON.parse(dataStr);
-                        
-                        // Chỉ quan tâm event text-delta
                         if (event.type === "text-delta" && event.delta) {
                           const chunk = {
                             id: "chatcmpl-" + crypto.randomUUID(),
                             object: "chat.completion.chunk",
                             created: Date.now(),
                             model: model,
-                            choices: [{
-                              index: 0,
-                              delta: { content: event.delta },
-                              finish_reason: null,
-                            }],
+                            choices: [{ index: 0, delta: { content: event.delta }, finish_reason: null }],
                           };
                           controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                         }
-                        
-                        // Xử lý sự kiện kết thúc
-                        if (event.type === "finish" || event.type === "text-end") {
-                            // Optional: Gửi finish reason nếu cần
-                        }
-
-                      } catch (e) { /* Ignore json parse error */ }
+                      } catch (e) { }
                     }
                   }
                 }
-                // Send DONE
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
               } catch (err) {
-                console.error("Stream Error:", err);
                 controller.error(err);
               } finally {
                 controller.close();
@@ -176,12 +172,9 @@ serve({
             },
           });
         } else {
-            // Non-stream mode (đơn giản hóa: trả về JSON khi xong hết stream - TODO nếu cần)
-            return Response.json({ error: "Only stream=true is supported in this demo implementation" }, { status: 400 });
+            return Response.json({ error: "Stream required" }, { status: 400 });
         }
-
       } catch (error) {
-        console.error("Server Error:", error);
         return new Response(JSON.stringify({ error: "Internal Server Error" }), { status: 500 });
       }
     }
